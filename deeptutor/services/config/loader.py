@@ -279,10 +279,18 @@ def get_agent_params(module_name: str) -> dict:
     module_config: dict[str, Any] = agents_config
     for key in section:
         module_config = module_config.get(key, {}) if isinstance(module_config, dict) else {}
-    return {
+    params = {
         "temperature": module_config.get("temperature", module_defaults["temperature"]),
         "max_tokens": module_config.get("max_tokens", module_defaults["max_tokens"]),
     }
+    # Optional per-capability model override. RootsEDU uses this to run the
+    # visualize/book visual generators on DeepSeek V4 Pro while chat stays on
+    # V4 Flash: Flash is fast for prose, Pro follows the strict HTML/JSON
+    # output contracts these blocks need.
+    model = module_config.get("model")
+    if isinstance(model, str) and model.strip():
+        params["model"] = model.strip()
+    return params
 
 
 DEFAULT_CHAT_PARAMS: dict[str, Any] = {

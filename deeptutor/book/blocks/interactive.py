@@ -93,7 +93,33 @@ class InteractiveGenerator(BlockGenerator):
 
         ok, validation_error = validate_visualization(code, "html")
         if not ok:
-            raise GenerationFailure(f"interactive html failed validation: {validation_error}")
+            # V4 Flash occasionally returns an empty document for the long
+            # single-file HTML prompt. A readable placeholder is better than
+            # failing the whole block; the visualize capability is routed to
+            # V4 Pro (agents.yaml) so this path is a safety net, not the norm.
+            from deeptutor.agents.visualize.utils import build_fallback_html
+
+            code = build_fallback_html(
+                title=chapter_title,
+                summary=chapter_summary,
+                note=(
+                    f"The model output could not be rendered ({validation_error}). "
+                    "A readable placeholder is shown."
+                ),
+            )
+            return (
+                {
+                    "render_type": "html",
+                    "code": {"language": "html", "content": code},
+                    "description": analysis.description,
+                    "chart_type": analysis.chart_type,
+                },
+                [],
+                {
+                    "review_changed": False,
+                    "review_notes": f"Fallback HTML used: {validation_error}",
+                },
+            )
 
         return (
             {

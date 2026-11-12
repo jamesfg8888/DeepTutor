@@ -165,6 +165,10 @@ class BaseAgent(ABC):
         if self.agent_config.get("model"):
             return self.agent_config["model"]
 
+        # 1b. Capability-level override from agents.yaml (e.g. visualize -> Pro)
+        if self._agent_params.get("model"):
+            return self._agent_params["model"]
+
         # 2. Try general LLM config
         if self.llm_config.get("model"):
             return self.llm_config["model"]

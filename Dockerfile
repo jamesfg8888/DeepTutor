@@ -88,6 +88,8 @@ RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.l
     libxrender1 \
     pkg-config \
     libssl-dev \
+    libcairo2-dev \
+    libpango1.0-dev \
     && rm -rf /var/lib/apt/lists/* \
     && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 
@@ -98,7 +100,8 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 COPY requirements/ ./requirements/
 COPY requirements.txt ./
 RUN pip install --upgrade pip && \
-    pip install -r requirements.txt
+    pip install -r requirements.txt && \
+    pip install "markitdown[all]>=0.1.7" "pymupdf4llm>=1.28.2" "manim>=0.19.0"
 
 # ============================================
 # Stage 3: Production Image
@@ -151,6 +154,9 @@ RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.l
     libxext6 \
     libxrender1 \
     ffmpeg \
+    libcairo2 \
+    libpango-1.0-0 \
+    libpangocairo-1.0-0 \
     libreoffice-writer \
     libreoffice-calc \
     libreoffice-impress \

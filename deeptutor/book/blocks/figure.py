@@ -96,12 +96,42 @@ class FigureGenerator(BlockGenerator):
                     review_notes="Passed local validation.",
                 )
             else:
-                review = await pipeline.run_repair(
-                    user_input=user_input,
-                    analysis=analysis,
-                    code=code,
-                    error=validation_error,
-                )
+                try:
+                    review = await pipeline.run_repair(
+                        user_input=user_input,
+                        analysis=analysis,
+                        code=code,
+                        error=validation_error,
+                    )
+                except Exception as repair_exc:
+                    # The repair agent is asked for JSON; a model that returns
+                    # prose/empty here used to fail the whole figure. A simple
+                    # Mermaid concept map is a valid, renderable fallback.
+                    logger.warning(
+                        "Figure repair failed; using Mermaid fallback: %s",
+                        repair_exc,
+                    )
+                    safe_title = (
+                        str(chapter_title or "Figure")
+                        .replace('"', "'")
+                        .replace("\n", " ")[:60]
+                    )
+                    fallback = f'flowchart TD\n  A["{safe_title}"] --> B["概念图"]\n'
+                    return (
+                        {
+                            "render_type": "mermaid",
+                            "code": {"language": "mermaid", "content": fallback},
+                            "description": chapter_summary or chapter_title,
+                            "chart_type": "flowchart",
+                        },
+                        [],
+                        {
+                            "review_changed": False,
+                            "review_notes": (
+                                f"Repair failed; Mermaid fallback used: {repair_exc}"
+                            ),
+                        },
+                    )
         except Exception as exc:
             logger.warning(f"FigureGenerator failed: {exc}", exc_info=True)
             raise GenerationFailure(f"figure generation failed: {exc}") from exc

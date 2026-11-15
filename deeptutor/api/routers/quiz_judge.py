@@ -15,6 +15,7 @@ from typing import Any
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
+from deeptutor.services import rootsedu_taxonomy
 from deeptutor.services.config import PROJECT_ROOT, load_config_with_main
 from deeptutor.services.llm import stream as llm_stream
 from deeptutor.services.settings.interface_settings import get_response_language
@@ -124,6 +125,36 @@ _JUDGE_SYSTEM_PROMPTS = {
 # — the previous ("zh", "en") literals were repeated in the whitelist, the
 # fallback and the frontend, and a Ukrainian UI silently got English feedback.
 SUPPORTED_JUDGE_LANGUAGES: frozenset[str] = frozenset(_JUDGE_SYSTEM_PROMPTS)
+
+
+def _schedule_writeback(user_token: Any, topic_id: str, verdict: str, score: float, full_judgment: list[str]) -> None:
+    """Record one mastery event in the taxonomy engine, off the WS close path.
+
+    The student id comes from the request-scoped ContextVar, so it is read
+    here while the handler coroutine still runs; the HTTP call itself is
+    dispatched to the default executor and its outcome is log-only.
+    """
+    from deeptutor.multi_user.context import get_current_user
+
+    student_id = get_current_user().id
+    result_text = "".join(full_judgment)[:2000]
+
+    def _run() -> None:
+        ok = rootsedu_taxonomy.record_learning_event(
+            student_id=student_id,
+            topic_id=topic_id,
+            activity_type="quiz",
+            score=score,
+            result=result_text,
+        )
+        if ok:
+            logger.info("Taxonomy writeback recorded %s/%s score %.2f", student_id, topic_id, score)
+
+    try:
+        loop = asyncio.get_running_loop()
+        loop.run_in_executor(None, _run)
+    except Exception as exc:  # pragma: no cover - executor shutdown edge
+        logger.debug("Taxonomy writeback not scheduled: %s", exc)
 
 
 def _build_judge_user_prompt(
@@ -347,12 +378,17 @@ async def websocket_quiz_judge(websocket: WebSocket):
             "user_answer_image": str | null,  # legacy single-image form
             "image_filename": str | null,     # legacy filename for the above
             "language": "zh" | "en" | "de" | "uk" | "vi",
+            # RootsEDU closed loop (optional): cn-math taxonomy topic id.
+            # When present and the verdict marker parses, the done frame
+            # carries {"score", "verdict", "topic_id"} and the event is
+            # written back to the taxonomy mastery engine (fire-and-forget).
+            "topic_id": str | null,
         }
 
     Server → Client (streaming):
         {"type": "started"}
         {"type": "text", "content": "..."}        # zero or more
-        {"type": "done"}
+        {"type": "done", "score"?: float, "verdict"?: str, "topic_id"?: str}
         {"type": "error", "content": "..."}
     """
     from deeptutor.api.routers.auth import ws_auth_failed, ws_require_auth
@@ -499,6 +535,7 @@ async def websocket_quiz_judge(websocket: WebSocket):
         return
 
     await safe_send({"type": "started"})
+    full_judgment: list[str] = []
 
     # Build a multimodal user message when ≥1 image was attached. We pass
     # the full ``messages`` array to ``factory.stream`` so it forwards the
@@ -540,9 +577,18 @@ async def websocket_quiz_judge(websocket: WebSocket):
             ):
                 if not chunk:
                     continue
+                full_judgment.append(chunk)
                 if not await safe_send({"type": "text", "content": chunk}):
                     break
-        await safe_send({"type": "done"})
+        done_frame: dict[str, Any] = {"type": "done"}
+        topic_id = (data.get("topic_id") or "").strip() or None
+        verdict, verdict_score = rootsedu_taxonomy.parse_verdict("".join(full_judgment))
+        if topic_id and verdict_score is not None:
+            done_frame["score"] = verdict_score
+            done_frame["verdict"] = verdict
+            done_frame["topic_id"] = topic_id
+            _schedule_writeback(user_token, topic_id, verdict, verdict_score, full_judgment)
+        await safe_send(done_frame)
     except TimeoutError:
         await safe_send({"type": "error", "content": "AI judge timed out. Please try again."})
     except WebSocketDisconnect:

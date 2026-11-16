@@ -2,7 +2,8 @@
 
 ``deeptutor/api/routers/quiz_judge.py`` previously had little line coverage:
 judge prompt assembly, image mime handling, and the WS
-judging loop (including disconnect cleanup) were essentially untested.
+judging loop (including disconnect cleanup) were essentially untested,
+as was the RootsEDU mastery writeback attached to the done frame.
 
 The LLM is mocked at ``quiz_judge.llm_stream`` — no real provider call is
 ever made. The socket is exercised two ways:
@@ -12,12 +13,18 @@ ever made. The socket is exercised two ways:
 * through a fake WebSocket for deterministic ordering of the disconnect
   and cleanup paths (``TestClient`` cannot control exactly when the send
   side breaks mid-stream).
+
+The writeback runs fire-and-forget on the default executor, so its tests
+replace ``httpx.post`` and observe the call through a ``threading.Event``
+rather than sleeping.
 """
 
 from __future__ import annotations
 
 import asyncio
 import base64
+import json
+import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -33,6 +40,7 @@ from deeptutor.api.routers.quiz_judge import (
     _build_multimodal_user_content,
     _guess_image_mime,
 )
+from deeptutor.services import rootsedu_taxonomy
 
 _WS_TOKEN = object()
 
@@ -924,3 +932,309 @@ class TestJudgeDisconnectAndCleanup:
 
         assert socket.sent == []
         assert stream.calls == []
+
+
+# ---------------------------------------------------------------------------
+# RootsEDU mastery writeback (docs/rootsedu/phase5-closed-loop-spec.md §1.4)
+# ---------------------------------------------------------------------------
+
+
+class _RecordSpy:
+    """Replaces ``httpx.post`` to capture taxonomy writeback POSTs.
+
+    ``record_learning_event`` imports ``httpx`` inside the function, so the
+    patch on the shared module object is visible from the executor thread
+    the writeback runs in. Each captured call sets an event: tests wait on
+    it to observe the POST, or wait a bounded moment to prove nothing was
+    sent.
+    """
+
+    def __init__(self) -> None:
+        self.status_code = 200
+        self.exc: Exception | None = None
+        self.calls: list[dict] = []
+        self._seen = threading.Event()
+
+    def __call__(self, url, **kwargs):
+        self.calls.append({"url": url, **kwargs})
+        self._seen.set()
+        if self.exc is not None:
+            raise self.exc
+        return SimpleNamespace(status_code=self.status_code)
+
+    def wait(self, timeout: float = 5.0) -> bool:
+        return self._seen.wait(timeout)
+
+
+@pytest.fixture
+def taxonomy_env(monkeypatch):
+    monkeypatch.setenv("ROOTSEDU_TAXONOMY_API_URL", "http://taxonomy-api:9000")
+
+
+@pytest.fixture
+def student_wp3(monkeypatch):
+    """Pin the request user so the writeback carries a wp_<id> student id."""
+    from deeptutor.multi_user import context
+
+    monkeypatch.setattr(context, "get_current_user", lambda: SimpleNamespace(id="wp_3"))
+
+
+@pytest.fixture
+def record_spy(monkeypatch):
+    import httpx
+
+    spy = _RecordSpy()
+    monkeypatch.setattr(httpx, "post", spy)
+    return spy
+
+
+class TestRootsEduWriteback:
+    @pytest.mark.parametrize(
+        ("marker", "verdict", "score"),
+        [("✅", "correct", 1.0), ("⚠️", "partial", 0.5), ("❌", "incorrect", 0.0)],
+    )
+    def test_first_line_marker_enriches_done_frame_and_records_one_event(
+        self,
+        ws_token,
+        reset_spy,
+        monkeypatch,
+        taxonomy_env,
+        student_wp3,
+        record_spy,
+        marker,
+        verdict,
+        score,
+    ):
+        stream = _ScriptedStream(
+            [f"{marker} your answer checks out.\n", "Detailed feedback follows."]
+        )
+        client = _judge_client(monkeypatch, stream)
+
+        with client.websocket_connect("/ws/questions/judge") as ws:
+            ws.send_json(_judge_payload(topic_id="cnm_001"))
+            assert ws.receive_json() == {"type": "started"}
+            assert ws.receive_json() == {
+                "type": "text",
+                "content": f"{marker} your answer checks out.\n",
+            }
+            assert ws.receive_json() == {"type": "text", "content": "Detailed feedback follows."}
+            assert ws.receive_json() == {
+                "type": "done",
+                "score": score,
+                "verdict": verdict,
+                "topic_id": "cnm_001",
+            }
+
+        assert record_spy.wait()
+        assert len(record_spy.calls) == 1
+        call = record_spy.calls[0]
+        assert call["url"] == "http://taxonomy-api:9000/api/record"
+        body = json.loads(call["content"])
+        assert body["student_id"] == "wp_3"
+        assert body["topic_id"] == "cnm_001"
+        assert body["activity_type"] == "quiz"
+        assert body["score"] == score
+        assert body["result"].startswith(f"{marker} ")
+        reset_spy.assert_called_once_with(ws_token)
+
+    def test_no_topic_id_sends_bare_done_frame_and_nothing_to_taxonomy(
+        self, ws_token, reset_spy, monkeypatch, taxonomy_env, student_wp3, record_spy
+    ):
+        stream = _ScriptedStream(["✅ correct — but no topic id was supplied."])
+        client = _judge_client(monkeypatch, stream)
+
+        with client.websocket_connect("/ws/questions/judge") as ws:
+            ws.send_json(_judge_payload())
+            assert ws.receive_json() == {"type": "started"}
+            assert ws.receive_json() == {
+                "type": "text",
+                "content": "✅ correct — but no topic id was supplied.",
+            }
+            assert ws.receive_json() == {"type": "done"}
+
+        assert not record_spy.wait(0.2)
+        assert record_spy.calls == []
+
+    def test_unparseable_first_line_sends_bare_done_frame_and_nothing(
+        self, ws_token, reset_spy, monkeypatch, taxonomy_env, student_wp3, record_spy
+    ):
+        # The marker only appears on a later line (e.g. quoting the right
+        # answer) — only the first non-empty line may drive a score.
+        stream = _ScriptedStream(["Let me walk through it.\n", "✅ it was right after all."])
+        client = _judge_client(monkeypatch, stream)
+
+        with client.websocket_connect("/ws/questions/judge") as ws:
+            ws.send_json(_judge_payload(topic_id="cnm_001"))
+            assert ws.receive_json() == {"type": "started"}
+            assert ws.receive_json() == {"type": "text", "content": "Let me walk through it.\n"}
+            assert ws.receive_json() == {"type": "text", "content": "✅ it was right after all."}
+            assert ws.receive_json() == {"type": "done"}
+
+        assert not record_spy.wait(0.2)
+        assert record_spy.calls == []
+
+    def test_foreign_topic_id_enriches_frame_but_never_posts(
+        self, ws_token, reset_spy, monkeypatch, taxonomy_env, student_wp3, record_spy
+    ):
+        # mt_* ids belong to the os-taxonomy space; recording them would
+        # orphan the event in the mastery engine, so the gate keeps them out
+        # of /api/record while the learner still sees the scored done frame.
+        stream = _ScriptedStream(["✅ correct."])
+        client = _judge_client(monkeypatch, stream)
+
+        with client.websocket_connect("/ws/questions/judge") as ws:
+            ws.send_json(_judge_payload(topic_id="mt_1xOenPgYl"))
+            assert ws.receive_json() == {"type": "started"}
+            assert ws.receive_json() == {"type": "text", "content": "✅ correct."}
+            assert ws.receive_json() == {
+                "type": "done",
+                "score": 1.0,
+                "verdict": "correct",
+                "topic_id": "mt_1xOenPgYl",
+            }
+
+        assert not record_spy.wait(0.2)
+        assert record_spy.calls == []
+
+    def test_taxonomy_outage_does_not_break_the_judgment(
+        self, ws_token, reset_spy, monkeypatch, taxonomy_env, student_wp3, record_spy
+    ):
+        record_spy.exc = RuntimeError("connection refused")
+        stream = _ScriptedStream(["❌ not correct."])
+        client = _judge_client(monkeypatch, stream)
+
+        with client.websocket_connect("/ws/questions/judge") as ws:
+            ws.send_json(_judge_payload(topic_id="cnm_001"))
+            assert ws.receive_json() == {"type": "started"}
+            assert ws.receive_json() == {"type": "text", "content": "❌ not correct."}
+            assert ws.receive_json() == {
+                "type": "done",
+                "score": 0.0,
+                "verdict": "incorrect",
+                "topic_id": "cnm_001",
+            }
+
+        assert record_spy.wait()
+        assert len(record_spy.calls) == 1
+
+    def test_missing_taxonomy_env_keeps_frame_but_records_nothing(
+        self, ws_token, reset_spy, monkeypatch, student_wp3, record_spy
+    ):
+        monkeypatch.delenv("ROOTSEDU_TAXONOMY_API_URL", raising=False)
+        stream = _ScriptedStream(["⚠️ partially correct."])
+        client = _judge_client(monkeypatch, stream)
+
+        with client.websocket_connect("/ws/questions/judge") as ws:
+            ws.send_json(_judge_payload(topic_id="cnm_001"))
+            assert ws.receive_json() == {"type": "started"}
+            assert ws.receive_json() == {"type": "text", "content": "⚠️ partially correct."}
+            assert ws.receive_json() == {
+                "type": "done",
+                "score": 0.5,
+                "verdict": "partial",
+                "topic_id": "cnm_001",
+            }
+
+        assert not record_spy.wait(0.2)
+        assert record_spy.calls == []
+
+
+class TestParseVerdict:
+    @pytest.mark.parametrize(
+        ("marker", "verdict", "score"),
+        [("✅", "correct", 1.0), ("⚠️", "partial", 0.5), ("❌", "incorrect", 0.0)],
+    )
+    def test_first_line_marker(self, marker, verdict, score):
+        assert rootsedu_taxonomy.parse_verdict(f"{marker} 答对了。") == (verdict, score)
+
+    def test_blank_lines_before_the_marker_still_count(self):
+        assert rootsedu_taxonomy.parse_verdict("\n\n  ✅ correct") == ("correct", 1.0)
+
+    def test_marker_on_a_later_line_is_ignored(self):
+        text = "Let me analyze this.\n✅ Actually correct."
+        assert rootsedu_taxonomy.parse_verdict(text) == ("unknown", None)
+
+    def test_no_marker_at_all(self):
+        assert rootsedu_taxonomy.parse_verdict("plain prose only") == ("unknown", None)
+
+    def test_empty_and_none_input(self):
+        assert rootsedu_taxonomy.parse_verdict("") == ("unknown", None)
+        assert rootsedu_taxonomy.parse_verdict(None) == ("unknown", None)  # type: ignore[arg-type]
+
+
+class TestTopicIdGate:
+    @pytest.mark.parametrize(
+        ("topic_id", "allowed"),
+        [
+            ("cnm_001", True),
+            ("cne_reading_01", True),
+            ("mt_1xOenPgYl", False),  # os-taxonomy id — must never be forwarded
+            ("wp_3", False),
+            ("CNM_001", False),
+            (" cnm_001", False),
+            ("cnm_001 extra", False),
+            ("", False),
+        ],
+    )
+    def test_regex_gate(self, topic_id, allowed):
+        assert bool(rootsedu_taxonomy.TOPIC_ID_RE.match(topic_id)) is allowed
+
+
+class TestRecordLearningEvent:
+    def test_requires_taxonomy_env(self, monkeypatch, record_spy):
+        monkeypatch.delenv("ROOTSEDU_TAXONOMY_API_URL", raising=False)
+        ok = rootsedu_taxonomy.record_learning_event(
+            student_id="wp_3", topic_id="cnm_001", activity_type="quiz", score=1.0, result="ok"
+        )
+        assert ok is False
+        assert record_spy.calls == []
+
+    def test_rejects_non_cn_topic_ids(self, taxonomy_env, record_spy):
+        ok = rootsedu_taxonomy.record_learning_event(
+            student_id="wp_3",
+            topic_id="mt_1xOenPgYl",
+            activity_type="quiz",
+            score=1.0,
+            result="ok",
+        )
+        assert ok is False
+        assert record_spy.calls == []
+
+    def test_posts_one_event_and_returns_true_on_2xx(self, taxonomy_env, record_spy):
+        ok = rootsedu_taxonomy.record_learning_event(
+            student_id="wp_3", topic_id="cnm_001", activity_type="quiz", score=0.5, result="✅ partial"
+        )
+        assert ok is True
+        assert len(record_spy.calls) == 1
+        call = record_spy.calls[0]
+        assert call["url"] == "http://taxonomy-api:9000/api/record"
+        body = json.loads(call["content"])
+        assert body == {
+            "student_id": "wp_3",
+            "topic_id": "cnm_001",
+            "activity_type": "quiz",
+            "score": 0.5,
+            "result": "✅ partial",
+        }
+
+    def test_truncates_result_to_2000_chars(self, taxonomy_env, record_spy):
+        ok = rootsedu_taxonomy.record_learning_event(
+            student_id="wp_3", topic_id="cnm_001", activity_type="quiz", score=1.0, result="x" * 3000
+        )
+        assert ok is True
+        body = json.loads(record_spy.calls[0]["content"])
+        assert body["result"] == "x" * 2000
+
+    def test_non_2xx_returns_false(self, taxonomy_env, record_spy):
+        record_spy.status_code = 503
+        ok = rootsedu_taxonomy.record_learning_event(
+            student_id="wp_3", topic_id="cnm_001", activity_type="quiz", score=1.0, result="ok"
+        )
+        assert ok is False
+
+    def test_transport_error_returns_false(self, taxonomy_env, record_spy):
+        record_spy.exc = RuntimeError("unreachable")
+        ok = rootsedu_taxonomy.record_learning_event(
+            student_id="wp_3", topic_id="cnm_001", activity_type="quiz", score=1.0, result="ok"
+        )
+        assert ok is False
